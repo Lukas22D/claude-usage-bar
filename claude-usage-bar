@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# Barra de consumo do plano claude.ai para o painel do GNOME (Executor).
+# Fonte: /api/oauth/usage, o mesmo endpoint que o /usage do Claude Code usa.
+# O token e lido do disco em runtime e so vai no header Authorization.
+# --debug: imprime o diagnostico da chamada em vez da barra (nunca imprime o token).
+#
+# O endpoint aplica rate limit e nao e documentado, entao o orcamento real e
+# desconhecido -- e o proprio Claude Code consome do mesmo balde. Dai o TTL
+# folgado e a penalidade apos 429.
+export LC_ALL=C
+export PATH="/usr/local/bin:/usr/bin:/bin"
+
+CACHE=~/.cache/claude-usage-bar.cache    # "usado limite epoch severidade"
+RETRY=~/.cache/claude-usage-bar.retry    # epoch antes do qual nao se tenta de novo
+LOG=~/.cache/claude-usage-bar.log
+TTL=900                                   # cota mensal: 15 min de frescor basta
+PENALTY=1800                              # ponytail: recuo fixo apos 429; exponencial se 30 min nao bastar
+STALE_MAX=172800                          # cota mensal envelhece devagar: 48h de cache ainda informa
+DEBUG=${1:-}
+
+mkdir -p ~/.cache
+now=$(date +%s)
+set -- $(cat "$CACHE" 2>/dev/null)
+c_used=$1 c_limit=$2 c_at=${3:-0} c_sev=${4:-normal}
+retry_at=$(cat "$RETRY" 2>/dev/null || echo 0)
+
+use_cache() { USED=$c_used; LIMIT=$c_limit; SEV=$c_sev; AGE=$((now - c_at)); }
+
+if [ "$DEBUG" != "--debug" ] && [ -n "$c_used" ] &&
+   { [ $((now - c_at)) -lt $TTL ] || [ "$now" -lt "$retry_at" ]; }; then
+    use_cache
+else
+    TOKEN=$(jq -r '.claudeAiOauth.accessToken // empty' ~/.claude/.credentials.json 2>/dev/null)
+    if [ -z "$TOKEN" ]; then
+        CODE=000 BODY='{"erro":"token ausente em ~/.claude/.credentials.json"}'
+    else
+        RESP=$(curl -s --max-time 8 -w '\n%{http_code}' https://api.anthropic.com/api/oauth/usage \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "anthropic-beta: oauth-2025-04-20" \
+            -H "anthropic-version: 2023-06-01" 2>/dev/null)
+        CODE=$(printf '%s' "$RESP" | tail -n1)
+        BODY=$(printf '%s' "$RESP" | sed '$d')
+        [ -z "$CODE" ] && CODE=000
+    fi
+
+    # severidade vem da propria API; "-" vira normal na renderizacao
+    TRIO=$(printf '%s' "$BODY" | jq -r '.spend | select(.used and .limit)
+           | "\(.used.amount_minor / pow(10; .used.exponent)) \(.limit.amount_minor / pow(10; .limit.exponent)) \(.severity // "-")"' 2>/dev/null)
+
+    # grava antes de qualquer saida: um --debug bem sucedido tambem prova
+    # que o limite liberou, entao deve destravar o widget.
+    if [ -n "$TRIO" ]; then
+        set -- $TRIO
+        USED=$1 LIMIT=$2 SEV=$3 AGE=0
+        echo "$USED $LIMIT $now $SEV" > "$CACHE"
+        rm -f "$RETRY"
+    else
+        echo "$(date -Is) http=$CODE recuo=${PENALTY}s" >> "$LOG"   # sem token, sem corpo
+        echo $((now + PENALTY)) > "$RETRY"
+        [ -n "$c_used" ] && [ $((now - c_at)) -lt $STALE_MAX ] && use_cache
+    fi
+
+    if [ "$DEBUG" = "--debug" ]; then
+        echo "HTTP       : $CODE"
+        echo "spend      : ${TRIO:-AUSENTE}"
+        echo "cache      : ${USED:-vazio} ${LIMIT:-} ${SEV:-} (gravado agora)"
+        echo "proxima tentativa liberada em: $([ "$now" -lt "$retry_at" ] && echo "$((retry_at - now))s" || echo agora)"
+        echo "corpo (sanitizado):"
+        printf '%s' "$BODY" | jq 'walk(if type == "string" and (test("@") or (length > 60)) then "<omitido>" else . end)' 2>/dev/null \
+            || printf '  resposta nao e JSON: %.200s\n' "$BODY"
+        exit 0
+    fi
+fi
+
+awk -v c="$USED" -v l="$LIMIT" -v age="${AGE:-}" -v sev="${SEV:-}" 'BEGIN{
+  # a API decide o nivel; qualquer valor desconhecido e tratado como alarme.
+  if (sev == "" || sev == "-" || sev == "normal") { fg = "#D97757"; bg = "#6B4437" }
+  else if (sev == "warning")                      { fg = "#E3B341"; bg = "#6B5520" }
+  else                                            { fg = "#E5534B"; bg = "#6B2A26" }
+
+  if (c == "" || l == "" || l + 0 <= 0) {
+    printf "<executor.markup.true><executor.tooltip.Sem dados: API nao respondeu e nao ha valor em cache. Rode claude-usage-bar --debug>"
+    printf "<span foreground=\"#6B4437\">░░░░░░░░░░ --%%</span>"
+    exit
+  }
+  p = c / l; if (p > 1) p = 1
+  n = int(p * 10 + 0.5)
+  for (i = 0; i < n; i++)  full = full "█"
+  for (i = n; i < 10; i++) rest = rest "░"
+
+  stale = (age + 0 > 1800)                      # o texto do tooltip nao pode conter ">"
+  tip = sprintf("$%.2f de $%.2f usados  -  restam $%.2f", c, l, l - c)
+  if (sev != "" && sev != "-" && sev != "normal") tip = tip sprintf("  [%s]", sev)
+  if (stale) tip = tip (age + 0 < 5400 \
+        ? sprintf("  (cache de %d min atras)", (age + 0) / 60) \
+        : sprintf("  (cache de %.0fh atras, API sem resposta)", (age + 0) / 3600))
+
+  # velho = tom apagado, mas mantendo a matiz da severidade: o alarme continua
+  # legivel como alarme, sem fingir que o dado e atual.
+  num = stale ? bg : fg
+  printf "<executor.markup.true><executor.tooltip.%s>", tip
+  printf "<span foreground=\"%s\">%s</span><span foreground=\"%s\">%s</span><span foreground=\"%s\"> %.0f%%</span>",
+         fg, full, bg, rest, num, p * 100
+}'
